@@ -59,10 +59,10 @@ export class SimpleTorrentClient {
             }
 
             console.log(`👥 Encontrados ${peers.length} peers disponibles`);
-            
+
 
             // Conectar a peers (máximo 5 conexiones simultáneas)
-            await this.connectToPeers(peers.slice(0, 5));
+            await this.connectToPeers(peers.slice(0, 20));
 
             // // Iniciar descarga secuencial
             await this.downloadSequentially();
@@ -83,13 +83,19 @@ export class SimpleTorrentClient {
     /**
      * Conecta a múltiples peers
      */
-    private async connectToPeers(peerList: Array<{ ip: string, port: number }>): Promise<void> {
-        console.log(`🔗 Conectando a ${peerList.length} peers...`);
+    private failedPeers: Set<string> = new Set();
 
+    private async connectToPeers(peerList: Array<{ ip: string; port: number }>): Promise<void> {
         const metadata = this.torrentParser.getMetadata();
         const peerId = CryptoUtils.generatePeerId();
 
         for (const peerInfo of peerList) {
+            const peerKey = `${peerInfo.ip}:${peerInfo.port}`;
+            if (this.failedPeers.has(peerKey)) {
+                console.log(`⚠️ Peer ${peerKey} ya rechazó la conexión anteriormente. Ignorando.`);
+                continue;
+            }
+
             try {
                 const peer = {
                     id: Buffer.alloc(20),
@@ -109,12 +115,10 @@ export class SimpleTorrentClient {
                 // Intentar conectar
                 await peerClient.connect();
                 this.activePeers.push(peerClient);
-
             } catch (error) {
-                if (error instanceof Error) {
-
+                if (error instanceof Error)
                     console.log(`⚠️ No se pudo conectar a ${peerInfo.ip}:${peerInfo.port} - ${error.message}`);
-                }
+                this.failedPeers.add(peerKey); // Marcar peer como fallido
             }
         }
 
@@ -127,6 +131,13 @@ export class SimpleTorrentClient {
     private setupPeerEvents(peerClient: PeerClient): void {
         peerClient.on('connected', () => {
             console.log(`🎯 Peer conectado y listo: ${peerClient.getPeerInfo().ip}`);
+
+            // Enviar mensajes de keep-alive cada 2 minutos
+            setInterval(() => {
+                if (peerClient.isConnected()) {
+                    peerClient.sendKeepAlive();
+                }
+            }, 120000); // 2 minutos
         });
 
         peerClient.on('unchoked', () => {
@@ -156,7 +167,7 @@ export class SimpleTorrentClient {
         console.log('📥 Iniciando descarga secuencial...');
 
         return new Promise((resolve, reject) => {
-            const checkProgress = () => {
+            const checkProgress = async () => {
                 if (this.pieceManager.isDownloadComplete()) {
                     console.log('🎉 ¡Descarga completada!');
                     this.downloadComplete = true;
@@ -175,10 +186,25 @@ export class SimpleTorrentClient {
                 const stats = this.pieceManager.getStats();
                 console.log(`📊 Progreso: ${stats.percentage.toFixed(1)}% (${stats.completed}/${stats.total} piezas)`);
 
-                // Verificar si aún tenemos peers activos
+                // Si no hay peers activos, buscar más
                 if (this.activePeers.length === 0) {
-                    reject(new Error('Todos los peers se desconectaron'));
-                    return;
+                    console.log('🔄 Todos los peers se desconectaron. Buscando más peers...');
+                    try {
+                        const newPeers = await this.trackerClient.getPeers(this.torrentParser.getMetadata());
+                        if (newPeers.length > 0) {
+                            console.log(`👥 Encontrados ${newPeers.length} nuevos peers`);
+                            await this.connectToPeers(newPeers.slice(0, 20)); // Conectar a un máximo de 20 nuevos peers
+                        } else {
+                            console.error('❌ No se encontraron más peers disponibles');
+                            reject(new Error('Todos los peers se desconectaron y no se encontraron más peers'));
+                            return;
+                        }
+                    } catch (error) {
+                        if (error instanceof Error)
+                            console.error(`❌ Error buscando más peers: ${error.message}`);
+                        reject(error);
+                        return;
+                    }
                 }
 
                 // Continuar verificando en 2 segundos
@@ -299,7 +325,7 @@ async function main() {
     //     process.exit(1);
     // }
 
-    const torrentPath = './torrents/maincra.torrent'; // args[0];
+    const torrentPath = './torrents/tracker--HDTV-temp-2-x-cap-1_17_12248.torrent'; // args[0];
     const outputDir = './downloads';
 
     try {

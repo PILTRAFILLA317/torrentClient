@@ -367,4 +367,10 @@ export class PeerClient extends EventEmitter {
   getPeerInfo(): Peer {
     return this.peer;
   }
+
+  sendKeepAlive(): void {
+    const keepAliveMessage = Buffer.from([0, 0, 0, 0]); // Mensaje de keep-alive (longitud 0)
+    this.sendData(keepAliveMessage);
+    console.log(`💓 Keep-alive enviado a ${this.peer.ip}`);
+  }
 }

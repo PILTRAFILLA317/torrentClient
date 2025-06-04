@@ -72,6 +72,29 @@ export class TrackerClient {
         throw new Error('No se pudo contactar con ningún tracker');
     }
 
+    // async getPeers(metadata: TorrentMetadata): Promise<Array<{ ip: string; port: number }>> {
+    //     const announceList = metadata.announceList;
+
+    //     // Realizar solicitudes a todos los trackers en paralelo
+    //     const peerLists = await Promise.all(
+    //         announceList.map(async (trackerUrl) => {
+    //             try {
+    //                 const peers = await this.announce(trackerUrl, metadata, 'started');
+    //                 console.log(`✅ Tracker ${trackerUrl} respondió con ${peers.length} peers`);
+    //                 return peers;
+    //             } catch (error) {
+    //                 if (error instanceof Error) {
+    //                     console.error(`⚠️ Error con tracker ${trackerUrl}: ${error.message}`);
+    //                 }
+    //                 return [];
+    //             }
+    //         })
+    //     );
+
+    //     // Combinar todas las listas de peers en una sola
+    //     return peerLists.flat();
+    // }
+
     /**
      * Contacta un tracker UDP
      */
