@@ -1,6 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { TorrentMetadata } from '../types/torrent';
+import { TorrentMetadata } from '../types/torrent_types';
 
 /**
  * Gestor de archivos para escribir datos descargados

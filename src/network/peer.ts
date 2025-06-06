@@ -1,8 +1,8 @@
 import * as net from 'net';
 import { EventEmitter } from 'events';
-import { MessageType, PeerMessage, PieceRequest, PieceData } from '../types/peer';
-import { Peer } from '../types/tracker';
-import { TorrentMetadata } from '../types/torrent';
+import { MessageType, PeerMessage, PieceRequest, PieceData } from '../types/peer_types';
+import { Peer } from '../types/tracker_types';
+import { TorrentMetadata } from '../types/torrent_types';
 import { BufferUtils } from '../utils/buffer';
 
 /**
@@ -16,6 +16,9 @@ export class PeerClient extends EventEmitter {
   private connected: boolean = false;
   private handshakeCompleted: boolean = false;
   private messageBuffer: Buffer = Buffer.alloc(0);
+  private downloadSpeed: number = 0;
+  private bytesDownloaded: number = 0;
+  private lastSpeedCalculation: number = Date.now();
 
   // Constantes del protocolo
   private static readonly PROTOCOL_STRING = 'BitTorrent protocol';
@@ -35,7 +38,7 @@ export class PeerClient extends EventEmitter {
   async connect(): Promise<void> {
     return new Promise((resolve, reject) => {
       console.log(`🔗 Conectando a peer ${this.peer.ip}:${this.peer.port}`);
-      
+
       this.socket = new net.Socket();
       this.setupSocketEvents();
 
@@ -49,7 +52,7 @@ export class PeerClient extends EventEmitter {
         clearTimeout(timeout);
         this.connected = true;
         console.log(`✅ Conectado a peer ${this.peer.ip}:${this.peer.port}`);
-        
+
         // Enviar handshake inmediatamente después de conectar
         this.sendHandshake();
         resolve();
@@ -148,9 +151,9 @@ export class PeerClient extends EventEmitter {
 
     this.peer.id = peerId;
     this.handshakeCompleted = true;
-    
+
     console.log(`🤝 Handshake completado con ${this.peer.ip}:${this.peer.port}`);
-    
+
     // Enviar mensaje de interés
     this.sendInterested();
     this.emit('connected');
@@ -163,7 +166,7 @@ export class PeerClient extends EventEmitter {
     while (this.messageBuffer.length >= 4) {
       // Leer longitud del mensaje
       const messageLength = BufferUtils.readUInt32BE(this.messageBuffer, 0);
-      
+
       // Keep-alive message (longitud 0)
       if (messageLength === 0) {
         this.messageBuffer = this.messageBuffer.slice(4);
@@ -249,6 +252,19 @@ export class PeerClient extends EventEmitter {
     const begin = BufferUtils.readUInt32BE(payload, 4);
     const block = payload.slice(8);
 
+    // Actualizar bytes descargados para cálculo de velocidad
+    this.bytesDownloaded += block.length;
+
+    // Calcular velocidad cada 10 segundos
+    const now = Date.now();
+    if (now - this.lastSpeedCalculation > 10000) {
+      const timeElapsed = (now - this.lastSpeedCalculation) / 1000;
+      this.downloadSpeed = this.bytesDownloaded / timeElapsed;
+      this.bytesDownloaded = 0;
+      this.lastSpeedCalculation = now;
+      console.log(`📊 Velocidad de ${this.peer.ip}: ${(this.downloadSpeed / 1024).toFixed(2)} KB/s`);
+    }
+
     const pieceData: PieceData = {
       index: pieceIndex,
       begin,
@@ -279,7 +295,7 @@ export class PeerClient extends EventEmitter {
     }
 
     console.log(`📤 Solicitando pieza ${pieceIndex} (${pieceLength} bytes)`);
-    
+
     // Solicitar la pieza en bloques de 16KB
     let offset = 0;
     while (offset < pieceLength) {
@@ -334,12 +350,12 @@ export class PeerClient extends EventEmitter {
    */
   hasPiece(pieceIndex: number): boolean {
     if (!this.peer.bitfield) return false;
-    
+
     const byteIndex = Math.floor(pieceIndex / 8);
     const bitIndex = 7 - (pieceIndex % 8);
-    
+
     if (byteIndex >= this.peer.bitfield.length) return false;
-    
+
     return (this.peer.bitfield[byteIndex] & (1 << bitIndex)) !== 0;
   }
 
@@ -372,5 +388,9 @@ export class PeerClient extends EventEmitter {
     const keepAliveMessage = Buffer.from([0, 0, 0, 0]); // Mensaje de keep-alive (longitud 0)
     this.sendData(keepAliveMessage);
     console.log(`💓 Keep-alive enviado a ${this.peer.ip}`);
+  }
+
+  getDownloadSpeed(): number {
+    return this.downloadSpeed;
   }
 }

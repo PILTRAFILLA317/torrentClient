@@ -1,4 +1,4 @@
-import { TorrentMetadata } from '../types/torrent';
+import { TorrentMetadata } from '../types/torrent_types';
 import { CryptoUtils } from '../utils/crypto';
 
 /**
@@ -49,6 +49,48 @@ export class PieceManager {
         }
 
         return pieces;
+    }
+
+    // Añadir a la clase PieceManager
+    getRarestPiece(peerBitfields: Map<string, boolean[]>): PieceInfo | null {
+        // Contar cuántos peers tienen cada pieza
+        const pieceCounts = new Map<number, number>();
+
+        // Inicializar contadores para todas las piezas
+        for (let i = 0; i < this.pieces.length; i++) {
+            if (!this.pieces[i].completed && !this.pieces[i].requested) {
+                pieceCounts.set(i, 0);
+            }
+        }
+
+        // Contar cuántos peers tienen cada pieza
+        for (const [_, bitfield] of peerBitfields.entries()) {
+            for (const [index, hasPiece] of bitfield.entries()) {
+                if (hasPiece && pieceCounts.has(index)) {
+                    pieceCounts.set(index, pieceCounts.get(index)! + 1);
+                }
+            }
+        }
+
+        // Encontrar la pieza más rara (la que menos peers tienen)
+        let rarestPieceIndex = -1;
+        let minCount = Infinity;
+
+        for (const [index, count] of pieceCounts.entries()) {
+            if (count > 0 && count < minCount) {
+                minCount = count;
+                rarestPieceIndex = index;
+            }
+        }
+
+        if (rarestPieceIndex !== -1) {
+            const piece = this.pieces[rarestPieceIndex];
+            piece.requested = true;
+            return piece;
+        }
+
+        // Si no encontramos ninguna pieza rara, volver al método secuencial
+        return this.getNextPieceToDownload();
     }
 
     /**

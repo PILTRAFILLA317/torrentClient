@@ -1,7 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { BencodeParser, BencodeDict } from '../parsers/bencode';
-import { TorrentFile, TorrentInfo, TorrentMetadata } from '../types/torrent';
+import { TorrentFile, TorrentInfo, TorrentMetadata } from '../types/torrent_types';
 import { CryptoUtils } from '../utils/crypto';
 
 /**

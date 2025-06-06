@@ -6,6 +6,7 @@ import { PeerClient } from './network/peer';
 import { PieceManager } from './core/piece-manager';
 import { FileManager } from './core/file-manager';
 import { CryptoUtils } from './utils/crypto';
+import { BufferUtils } from './utils/buffer';
 
 /**
  * Cliente BitTorrent simple
@@ -18,6 +19,7 @@ export class SimpleTorrentClient {
     private activePeers: PeerClient[] = [];
     private downloadComplete: boolean = false;
     private piecesInProgress: Set<number> = new Set();
+    private pieceTimeouts: Map<number, NodeJS.Timeout> = new Map();
 
     constructor(torrentPath: string, outputDir: string = './downloads') {
         console.log('🚀 Iniciando Simple Torrent Client');
@@ -62,7 +64,7 @@ export class SimpleTorrentClient {
 
 
             // Conectar a peers (máximo 5 conexiones simultáneas)
-            await this.connectToPeers(peers.slice(0, 20));
+            await this.connectToPeers(peers.slice(0, 30));
 
             // // Iniciar descarga secuencial
             await this.downloadSequentially();
@@ -89,11 +91,14 @@ export class SimpleTorrentClient {
         const metadata = this.torrentParser.getMetadata();
         const peerId = CryptoUtils.generatePeerId();
 
-        for (const peerInfo of peerList) {
+        console.log(`🔌 Intentando conectar a ${peerList.length} peers en paralelo...`);
+
+        // Crear promesas para conectar a todos los peers simultáneamente
+        const connectionPromises = peerList.map(async (peerInfo) => {
             const peerKey = `${peerInfo.ip}:${peerInfo.port}`;
+
             if (this.failedPeers.has(peerKey)) {
-                console.log(`⚠️ Peer ${peerKey} ya rechazó la conexión anteriormente. Ignorando.`);
-                continue;
+                return null; // Ignorar peers que ya fallaron
             }
 
             try {
@@ -108,21 +113,34 @@ export class SimpleTorrentClient {
                 };
 
                 const peerClient = new PeerClient(peer, metadata, peerId);
-
-                // Configurar eventos del peer
                 this.setupPeerEvents(peerClient);
 
-                // Intentar conectar
-                await peerClient.connect();
-                this.activePeers.push(peerClient);
-            } catch (error) {
-                if (error instanceof Error)
-                    console.log(`⚠️ No se pudo conectar a ${peerInfo.ip}:${peerInfo.port} - ${error.message}`);
-                this.failedPeers.add(peerKey); // Marcar peer como fallido
-            }
-        }
+                // Establecer un timeout para la conexión
+                const connectPromise = peerClient.connect();
+                const timeoutPromise = new Promise<void>((_, reject) => {
+                    setTimeout(() => reject(new Error('Timeout')), 5000); // 5 segundos de timeout
+                });
 
-        console.log(`✅ Conectado a ${this.activePeers.length} peers`);
+                await Promise.race([connectPromise, timeoutPromise]);
+                return peerClient;
+
+            } catch (error) {
+                this.failedPeers.add(peerKey);
+                return null;
+            }
+        });
+
+        // Esperar a que todas las conexiones se intenten
+        const results = await Promise.allSettled(connectionPromises);
+
+        // Filtrar los peers conectados exitosamente
+        results.forEach(result => {
+            if (result.status === 'fulfilled' && result.value !== null) {
+                this.activePeers.push(result.value);
+            }
+        });
+
+        console.log(`✅ Conectado exitosamente a ${this.activePeers.length} peers de ${peerList.length}`);
     }
 
     /**
@@ -164,7 +182,22 @@ export class SimpleTorrentClient {
      * Descarga piezas de forma secuencial
      */
     private async downloadSequentially(): Promise<void> {
-        console.log('📥 Iniciando descarga secuencial...');
+        console.log('📥 Iniciando descarga con estrategia distribuida...');
+        let reconnectAttempts = 0;
+        const MAX_RECONNECT_ATTEMPTS = 5;
+
+        // Mapa para almacenar los bitfields de cada peer
+        const peerBitfields = new Map<string, boolean[]>();
+
+        // Configurar evento para capturar bitfields
+        this.activePeers.forEach(peer => {
+            peer.on('bitfield', (bitfield) => {
+                const peerInfo = peer.getPeerInfo();
+                const peerKey = `${peerInfo.ip}:${peerInfo.port}`;
+                const boolArray = BufferUtils.bitfieldToArray(bitfield, this.torrentParser.getMetadata().pieceCount);
+                peerBitfields.set(peerKey, boolArray);
+            });
+        });
 
         return new Promise((resolve, reject) => {
             const checkProgress = async () => {
@@ -175,39 +208,49 @@ export class SimpleTorrentClient {
                     return;
                 }
 
-                // Solicitar siguiente pieza a peers disponibles
+                // Ordenar peers por velocidad de descarga
+                this.activePeers.sort((a, b) => b.getDownloadSpeed() - a.getDownloadSpeed());
+
+                // Distribuir solicitudes entre todos los peers disponibles
+                let requestsMade = 0;
                 for (const peer of this.activePeers) {
                     if (peer.isConnected() && !peer.isChoked()) {
-                        this.requestNextPiece(peer);
-                    }
-                }
-
-                // Mostrar progreso cada 5 segundos
-                const stats = this.pieceManager.getStats();
-                console.log(`📊 Progreso: ${stats.percentage.toFixed(1)}% (${stats.completed}/${stats.total} piezas)`);
-
-                // Si no hay peers activos, buscar más
-                if (this.activePeers.length === 0) {
-                    console.log('🔄 Todos los peers se desconectaron. Buscando más peers...');
-                    try {
-                        const newPeers = await this.trackerClient.getPeers(this.torrentParser.getMetadata());
-                        if (newPeers.length > 0) {
-                            console.log(`👥 Encontrados ${newPeers.length} nuevos peers`);
-                            await this.connectToPeers(newPeers.slice(0, 20)); // Conectar a un máximo de 20 nuevos peers
-                        } else {
-                            console.error('❌ No se encontraron más peers disponibles');
-                            reject(new Error('Todos los peers se desconectaron y no se encontraron más peers'));
-                            return;
+                        // Intentar solicitar hasta 3 piezas por peer en cada ciclo
+                        for (let i = 0; i < 3; i++) {
+                            if (this.requestPieceFromPeer(peer, peerBitfields)) {
+                                requestsMade++;
+                            }
                         }
-                    } catch (error) {
-                        if (error instanceof Error)
-                            console.error(`❌ Error buscando más peers: ${error.message}`);
-                        reject(error);
-                        return;
                     }
                 }
 
-                // Continuar verificando en 2 segundos
+                // Mostrar estadísticas
+                const stats = this.pieceManager.getStats();
+                console.log(`📊 Progreso: ${stats.percentage.toFixed(1)}% (${stats.completed}/${stats.total} piezas) - Solicitudes: ${requestsMade}`);
+
+                // Verificar si necesitamos más peers
+                if (this.activePeers.length < 5 || requestsMade === 0) {
+                    console.log(`🔍 Buscando más peers (activos: ${this.activePeers.length})...`);
+
+                    if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+                        console.log(`⚠️ Máximo de intentos de reconexión alcanzado, continuando con los peers disponibles`);
+                    } else {
+                        reconnectAttempts++;
+                        try {
+                            const newPeers = await this.trackerClient.getPeers(this.torrentParser.getMetadata());
+                            if (newPeers.length > 0) {
+                                console.log(`👥 Encontrados ${newPeers.length} nuevos peers`);
+                                // Conectar a más peers (hasta 50)
+                                await this.connectToPeers(newPeers.slice(0, 50));
+                            }
+                        } catch (error) {
+                            if (error instanceof Error)
+                                console.log(`⚠️ Error buscando peers: ${error.message}`);
+                        }
+                    }
+                }
+
+                // Continuar verificando
                 setTimeout(checkProgress, 2000);
             };
 
@@ -216,24 +259,55 @@ export class SimpleTorrentClient {
         });
     }
 
-    /**
-     * Solicita la siguiente pieza a un peer específico
-     */
-    private requestNextPiece(peerClient: PeerClient): void {
-        const piece = this.pieceManager.getNextPieceToDownload();
+    // Nuevo método para solicitar piezas a un peer específico
+    private requestPieceFromPeer(peer: PeerClient, peerBitfields: Map<string, boolean[]>): boolean {
+        // Obtener la pieza más rara que este peer tenga
+        const peerInfo = peer.getPeerInfo();
+        const peerKey = `${peerInfo.ip}:${peerInfo.port}`;
 
-        if (piece && peerClient.hasPiece(piece.index) && !this.piecesInProgress.has(piece.index)) {
-            console.log(`📤 Solicitando pieza ${piece.index} a ${peerClient.getPeerInfo().ip}`);
-            this.piecesInProgress.add(piece.index);
-            peerClient.requestPiece(piece.index, piece.size);
+        // Si tenemos el bitfield de este peer, usarlo para la estrategia rarest-first
+        if (peerBitfields.has(peerKey)) {
+            const piece = this.pieceManager.getRarestPiece(peerBitfields);
+
+            if (piece && !this.piecesInProgress.has(piece.index)) {
+                const bitfield = peerBitfields.get(peerKey)!;
+
+                // Verificar si este peer tiene la pieza
+                if (bitfield[piece.index]) {
+                    console.log(`📤 Solicitando pieza rara ${piece.index} a ${peerInfo.ip}`);
+                    this.piecesInProgress.add(piece.index);
+                    peer.requestPiece(piece.index, piece.size);
+                    return true;
+                }
+            }
         }
+
+        // Fallback: solicitar la siguiente pieza secuencial
+        const piece = this.pieceManager.getNextPieceToDownload();
+        if (piece && !this.piecesInProgress.has(piece.index)) {
+            console.log(`📤 Solicitando pieza secuencial ${piece.index} a ${peerInfo.ip}`);
+            this.piecesInProgress.add(piece.index);
+            peer.requestPiece(piece.index, piece.size);
+            return true;
+        }
+
+        return false;
     }
 
     /**
      * Maneja datos de pieza recibidos (CORREGIDO)
      */
+    // Añadir como propiedad de la clase
+
+    // Modificar el método handlePieceData
     private async handlePieceData(pieceData: any, peerClient: PeerClient): Promise<void> {
         const { index: pieceIndex, begin: offset, block } = pieceData;
+
+        // Limpiar timeout si existe
+        if (this.pieceTimeouts.has(pieceIndex)) {
+            clearTimeout(this.pieceTimeouts.get(pieceIndex)!);
+            this.pieceTimeouts.delete(pieceIndex);
+        }
 
         // Añadir bloque a la pieza
         const pieceCompleted = this.pieceManager.addBlockToPiece(pieceIndex, offset, block);
@@ -248,8 +322,32 @@ export class SimpleTorrentClient {
                 await this.fileManager.writePiece(pieceIndex, pieceData);
             }
 
-            // Solicitar siguiente pieza
-            this.requestNextPiece(peerClient);
+            // Solicitar más piezas a este peer (ya que respondió bien)
+            for (let i = 0; i < 3; i++) {
+                if (peerClient.isConnected() && !peerClient.isChoked()) {
+                    this.requestNextPiece(peerClient);
+                }
+            }
+        }
+    }
+
+    // Modificar el método requestNextPiece
+    private requestNextPiece(peerClient: PeerClient): void {
+        const piece = this.pieceManager.getNextPieceToDownload();
+
+        if (piece && !this.piecesInProgress.has(piece.index)) {
+            console.log(`📤 Solicitando pieza ${piece.index} a ${peerClient.getPeerInfo().ip}`);
+            this.piecesInProgress.add(piece.index);
+            peerClient.requestPiece(piece.index, piece.size);
+
+            // Establecer timeout para esta pieza
+            const timeout = setTimeout(() => {
+                console.log(`⏱️ Timeout para pieza ${piece.index}, liberando para reintento`);
+                this.pieceManager.resetPieceRequest(piece.index);
+                this.piecesInProgress.delete(piece.index);
+            }, 30000); // 30 segundos
+
+            this.pieceTimeouts.set(piece.index, timeout);
         }
     }
 
@@ -259,7 +357,28 @@ export class SimpleTorrentClient {
     private removePeer(peerClient: PeerClient): void {
         const index = this.activePeers.indexOf(peerClient);
         if (index > -1) {
+            const peerInfo = peerClient.getPeerInfo();
+            console.log(`🔌 Removiendo peer ${peerInfo.ip}:${peerInfo.port}`);
+
             this.activePeers.splice(index, 1);
+
+            // Liberar todas las piezas que este peer estaba descargando
+            // (Esto es crucial para evitar que la descarga se quede atascada)
+            for (const pieceIndex of this.piecesInProgress) {
+                const piece = this.pieceManager.getPieceInfo(pieceIndex);
+                if (piece && !piece.completed) {
+                    console.log(`🔄 Liberando pieza ${pieceIndex} para reintento`);
+                    this.pieceManager.resetPieceRequest(pieceIndex);
+                    this.piecesInProgress.delete(pieceIndex);
+
+                    // Limpiar timeout si existe
+                    if (this.pieceTimeouts.has(pieceIndex)) {
+                        clearTimeout(this.pieceTimeouts.get(pieceIndex)!);
+                        this.pieceTimeouts.delete(pieceIndex);
+                    }
+                }
+            }
+
             peerClient.disconnect();
         }
     }
@@ -311,6 +430,7 @@ export class SimpleTorrentClient {
             }
         }
     }
+
 }
 
 /**
@@ -325,7 +445,7 @@ async function main() {
     //     process.exit(1);
     // }
 
-    const torrentPath = './torrents/tracker--HDTV-temp-2-x-cap-1_17_12248.torrent'; // args[0];
+    const torrentPath = './torrents/maincra.torrent'; // args[0];
     const outputDir = './downloads';
 
     try {

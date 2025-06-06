@@ -3,8 +3,8 @@ import * as https from 'https';
 import * as dgram from 'dgram';
 import * as url from 'url';
 import { BencodeParser } from '../parsers/bencode';
-import { TrackerResponse, PeerInfo } from '../types/tracker';
-import { TorrentMetadata } from '../types/torrent';
+import { TrackerResponse, PeerInfo } from '../types/tracker_types';
+import { TorrentMetadata } from '../types/torrent_types';
 import { CryptoUtils } from '../utils/crypto';
 import { BufferUtils } from '../utils/buffer';
 
@@ -38,14 +38,14 @@ export class TrackerClient {
         torrentMetadata: TorrentMetadata,
         event: 'started' | 'stopped' | 'completed' | undefined = 'started'
     ): Promise<Array<{ ip: string; port: number }>> {
-        console.log(`🔍 Contactando trackers para obtener peers...`);
+        console.log(`🔍 Contactando trackers en paralelo para obtener peers...`);
 
-        // Intentar con cada tracker hasta encontrar uno que funcione
-        for (const trackerUrl of torrentMetadata.announceList) {
+        // Crear un array de promesas para contactar a todos los trackers simultáneamente
+        const trackerPromises = torrentMetadata.announceList.map(async (trackerUrl) => {
             try {
-                console.log(`📡 Probando tracker: ${trackerUrl}`);
+                console.log(`📡 Contactando tracker: ${trackerUrl}`);
 
-                let peers: Array<{ ip: string; port: number }>;
+                let peers: Array<{ ip: string; port: number }> = [];
 
                 if (trackerUrl.startsWith('udp://')) {
                     peers = await this.contactUdpTracker(trackerUrl, torrentMetadata, event);
@@ -53,23 +53,51 @@ export class TrackerClient {
                     peers = await this.contactHttpTracker(trackerUrl, torrentMetadata, event);
                 } else {
                     console.log(`⚠️ Protocolo no soportado para: ${trackerUrl}`);
-                    continue;
+                    return [];
                 }
 
                 if (peers.length > 0) {
-                    console.log(`✅ Obtenidos ${peers.length} peers del tracker`);
-                    return peers;
+                    console.log(`✅ Tracker ${trackerUrl} respondió con ${peers.length} peers`);
+                } else {
+                    console.log(`ℹ️ Tracker ${trackerUrl} no devolvió peers`);
                 }
+
+                return peers;
             } catch (error) {
                 if (error instanceof Error) {
-
                     console.log(`❌ Error con tracker ${trackerUrl}: ${error.message}`);
                 }
-                continue;
+                return []; // Devolver array vacío en caso de error
             }
+        });
+
+        // Esperar a que todas las promesas se resuelvan (con Promise.allSettled para manejar errores)
+        const results = await Promise.allSettled(trackerPromises);
+
+        // Recopilar todos los peers de los trackers que respondieron exitosamente
+        const allPeers: Array<{ ip: string; port: number }> = [];
+        const uniquePeers = new Map<string, { ip: string; port: number }>();
+
+        results.forEach((result) => {
+            if (result.status === 'fulfilled' && result.value.length > 0) {
+                result.value.forEach(peer => {
+                    const peerKey = `${peer.ip}:${peer.port}`;
+                    if (!uniquePeers.has(peerKey)) {
+                        uniquePeers.set(peerKey, peer);
+                    }
+                });
+            }
+        });
+
+        // Convertir el Map a array
+        const uniquePeersList = Array.from(uniquePeers.values());
+
+        if (uniquePeersList.length === 0) {
+            throw new Error('No se pudo obtener peers de ningún tracker');
         }
 
-        throw new Error('No se pudo contactar con ningún tracker');
+        console.log(`✅ Total: ${uniquePeersList.length} peers únicos obtenidos de todos los trackers`);
+        return uniquePeersList;
     }
 
     // async getPeers(metadata: TorrentMetadata): Promise<Array<{ ip: string; port: number }>> {
